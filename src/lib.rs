@@ -128,6 +128,32 @@ fn tcp_port_available(address: &str) -> bool {
     }
 }
 
+/// Resolve `PROBING_PORT` to a usable HTTP bind address.
+///
+/// Returns `None` when the port is busy or malformed; in both cases the local
+/// Unix socket remains available.
+fn resolve_http_bind(port_env_val: &str) -> Option<String> {
+    match probing_server::bind_address_from_port(port_env_val) {
+        Ok(address) => {
+            if tcp_port_available(&address) {
+                Some(address)
+            } else {
+                log::warn!(
+                    "PROBING_PORT {port_env_val} is already in use; HTTP server disabled for pid {} (local Unix socket remains available)",
+                    std::process::id()
+                );
+                None
+            }
+        }
+        Err(_) => {
+            log::warn!(
+                "ENV_PROBING_PORT value '{port_env_val}' is not 'RANDOM' and not a valid port number."
+            );
+            None
+        }
+    }
+}
+
 /// Setup environment variables for server configuration (single-process only).
 ///
 /// Multi-process torchrun jobs bind HTTP and run hierarchical cluster report in Rust.
@@ -147,24 +173,12 @@ fn setup_env_settings() {
     }
 
     match std::env::var(ENV_PROBING_PORT) {
-        Ok(port_env_val) => match probing_server::bind_address_from_port(&port_env_val) {
-            Ok(address) => {
-                if !tcp_port_available(&address) {
-                    log::warn!(
-                        "PROBING_PORT {port_env_val} is already in use; HTTP server disabled for pid {} (local Unix socket remains available)",
-                        std::process::id()
-                    );
-                    return;
-                }
+        Ok(port_env_val) => {
+            if let Some(address) = resolve_http_bind(&port_env_val) {
                 log::debug!("PROBING_SERVER_ADDR set to {address}");
                 std::env::set_var("PROBING_SERVER_ADDR", address);
             }
-            Err(_) => {
-                log::warn!(
-                    "ENV_PROBING_PORT value '{port_env_val}' is not 'RANDOM' and not a valid port number."
-                );
-            }
-        },
+        }
         Err(_) => {
             log::debug!("ENV_PROBING_PORT not set. PROBING_SERVER_ADDR will not be set.");
         }
@@ -295,4 +309,33 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     tracing::register_tracing_functions(m)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn tcp_port_available_rejects_bound_address() {
+        let listener = TcpListener::bind("0.0.0.0:0").expect("bind ephemeral port");
+        let address = listener.local_addr().expect("local addr").to_string();
+
+        assert!(!tcp_port_available(&address));
+
+        drop(listener);
+        assert!(tcp_port_available(&address));
+    }
+
+    #[test]
+    fn resolve_http_bind_handles_busy_and_invalid_ports() {
+        let listener = TcpListener::bind("0.0.0.0:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+
+        assert!(resolve_http_bind(&port.to_string()).is_none());
+        assert!(resolve_http_bind("not-a-port").is_none());
+
+        drop(listener);
+        assert!(resolve_http_bind(&port.to_string()).is_some());
+    }
 }
